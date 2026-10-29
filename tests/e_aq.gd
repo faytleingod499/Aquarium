@@ -1,0 +1,359 @@
+extends SceneTree
+# Headless test of the Aquarium mod against the decompiled game (real PlayerData, Globals, Network, UserSave, the
+# real aqua_fish scene and the real tank_insert.gd). Run with tests/run.sh.
+# (SceneTree scripts are compiled before the autoloads exist, so the game's singletons are reached with get_node.)
+
+var T = ""
+var PD
+var NW
+var US
+var GL
+var world
+var hud
+var player
+var tank
+var mod
+var fails = 0
+var checks = 0
+var loc
+
+const FISH = ["fish_lake_bluegill", "fish_lake_crab", "fish_lake_rainbowtrout", "fish_lake_sturgeon", "fish_rain_heliocoprion", "fish_alien_dog", "fish_rain_leedsichthys"]
+
+
+func check(name, cond):
+	checks += 1
+	if cond:
+		print("ok   ", name)
+	else:
+		fails += 1
+		print("FAIL ", name)
+
+
+func _init():
+	call_deferred("_go")
+
+
+func fish(i, quality = 0, size = 40.0):
+	return PD._add_item(FISH[i], - 1, size, quality)
+
+
+func owned_fish_actors():
+	var out = []
+	for a in get_nodes_in_group("actor"):
+		if is_instance_valid(a) and a.get("actor_type") == "aqua_fish" and a.owner_id == NW.STEAM_ID:
+			out.append(a)
+	return out
+
+
+# waits (up to a few seconds) until every one of my fish actors has the given visibility; the actors set it in their
+# physics step, which does not run at a fixed number per idle frame
+func wait_visible(want):
+	for n in 300:
+		yield(self, "idle_frame")
+		var ok = true
+		for a in owned_fish_actors():
+			if a.visible != want:
+				ok = false
+		if ok:
+			return true
+	return false
+
+
+func tick():
+	mod._tick()
+	yield(self, "idle_frame")
+
+
+func _go():
+	T = OS.get_environment("TESTS_DIR")
+	if OS.get_environment("AQ_PCK") != "":
+		print("note  using the built pck: ", OS.get_environment("AQ_PCK"), " mounted: ", ProjectSettings.load_resource_pack(OS.get_environment("AQ_PCK")))
+	PD = root.get_node("PlayerData")
+	NW = root.get_node("Network")
+	US = root.get_node("UserSave")
+	GL = root.get_node("Globals")
+	NW.STEAM_ID = 4242
+	# no Steam library here, so the game's Network stops initialising its variables partway: set what the mod touches
+	NW.STEAM_LOBBY_ID = 0
+	NW.PLAYING_OFFLINE = true
+	NW.OWNED_ACTORS = []
+	US.current_loaded_slot = - 1   # the mod's file for "no slot"; the game's own save is not written
+	var d = Directory.new()
+	for f in ["user://aquarium_slot_-1.json", "user://aquarium_slot_-1.json.bak", "user://aquarium_slot_-1.json.tmp", "user://aquarium_slot_-1.json.unreadable", "user://aquarium_slot_7.json"]:
+		if d.file_exists(f):
+			d.remove(f)
+
+	print("--- setup")
+	world = load(T + "/stubs/world.gd").new()
+	root.add_child(world)
+	loc = Position3D.new()
+	loc.add_to_group("aqua_spawn_loc")
+	root.add_child(loc)
+	loc.global_transform.origin = Vector3(5, 1, - 20)
+	hud = load(T + "/stub_hud.gd").new()
+	root.add_child(hud)
+	player = load(T + "/stub_player.gd").new()
+	player.world = world
+	player.hud = hud
+	root.add_child(player)
+	tank = Area.new()
+	tank.set_script(load("res://Scenes/Map/Zones/tank_insert.gd"))
+	root.add_child(tank)
+	# the game's own fish, created the way world.gd creates it
+	NW._sync_create_actor("aqua_fish", loc.global_transform.origin, "aquarium_zone", - 1, NW.STEAM_ID)
+	yield(self, "idle_frame")
+	mod = load(T + "/spy_main.gd").new()
+	mod.name = "Aquarium"
+	root.add_child(mod)
+	yield(self, "idle_frame")
+
+	var vanilla = owned_fish_actors()[0]
+	check("the game's own fish exists and is controlled", owned_fish_actors().size() == 1 and vanilla.controlled)
+	check("vanilla fish is connected to the aquarium update", PD.is_connected("_aquarium_update", vanilla, "_host_change_id"))
+	check("vanilla fish has the broken join connection (the game's own bug)", NW.is_connected("_new_player_join", vanilla, "_host_change_id"))
+
+	print("--- the tank is hooked")
+	yield(tick(), "completed")
+	check("tank script replaced by the mod's", str(tank.get_script().resource_path).ends_with("mods/Aquarium/tank.gd"))
+	check("tank text", tank.text == "AQUARIUM")
+	check("tank still an interactable", tank.is_in_group("interactable"))
+	check("vanilla fish: broken join connection taken over", not NW.is_connected("_new_player_join", vanilla, "_host_change_id"))
+	check("vanilla fish: still follows the aquarium update", PD.is_connected("_aquarium_update", vanilla, "_host_change_id"))
+	check("empty tank: only the game's fish exists", owned_fish_actors().size() == 1)
+
+	print("--- open the list")
+	tank._activate(player)
+	check("list open", mod.ui != null and hud.popups.has("AQUARIUM_MOD"))
+	check("title shows 0 / 5", mod.ui_title.text.ends_with("0 / 5"))
+	check("five rows", mod.ui_list.get_child_count() == 5)
+	check("add button disabled with nothing held", mod.ui_add.disabled)
+	tank._activate(player)
+	check("a second activation does not open a second list", hud.popups.size() == 1)
+	mod.close()
+	check("closing frees the popup", mod.ui == null and hud.popups.empty())
+
+	print("--- fill the tank")
+	var refs = []
+	for i in 6:
+		refs.append(fish(i, i % 3, 30.0 + i * 11))
+	var inv_before = PD.inventory.size()
+	check("not holding a fish -> refused", mod.add_held(player) != "")
+	player.hold(refs[0])
+	check("adding the first fish works", mod.add_held(player) == "")
+	check("first fish is in the game's own slot", PD.saved_aqua_fish["ref"] == refs[0] and PD.saved_aqua_fish["id"] == FISH[0])
+	check("first fish left the inventory", PD.inventory.size() == inv_before - 1)
+	check("hands were emptied", player.held_item["ref"] == 0)
+	check("no extras yet", mod.extras.size() == 0)
+	for i in range(1, 5):
+		player.hold(refs[i])
+		check("adding fish %d works" % (i + 1), mod.add_held(player) == "")
+	check("tank holds 5", mod.fish_count() == 5)
+	check("4 extras", mod.extras.size() == 4)
+	check("order is the order they were added", mod.all_fish()[3]["ref"] == refs[3] and mod.all_fish()[4]["ref"] == refs[4])
+	player.hold(refs[5])
+	var msg = mod.add_held(player)
+	check("a sixth fish is refused", msg != "" and mod.fish_count() == 5)
+	var still = false
+	for it in PD.inventory:
+		if it["ref"] == refs[5]:
+			still = true
+	check("the refused fish is still in the inventory", still)
+	check("the refused fish is still held", player.held_item["ref"] == refs[5])
+
+	print("--- the mod's file")
+	var f = File.new()
+	check("file written", f.file_exists("user://aquarium_slot_-1.json"))
+	f.open("user://aquarium_slot_-1.json", File.READ)
+	var parsed = JSON.parse(f.get_as_text())
+	f.close()
+	check("file holds the 4 extras, not the game's own fish", parsed.error == OK and parsed.result["fish"].size() == 4 and int(parsed.result["fish"][0]["ref"]) == refs[1])
+	mod.extras = []
+	mod.loaded_slot = - 999
+	mod._check_slot()
+	check("the file loads back", mod.extras.size() == 4 and mod.extras[2]["ref"] == refs[3] and mod.extras[2]["id"] == FISH[3])
+	check("quality and size survive the file", mod.extras[0]["quality"] == 1 % 3 and abs(mod.extras[0]["size"] - 41.0) < 0.01)
+
+	print("--- the fish in the tank")
+	yield(tick(), "completed")
+	var mine = owned_fish_actors()
+	check("five fish actors in my game", mine.size() == 5)
+	check("fish 2 is a real, announced actor (owned actor)", mod.actors[0] != null and NW.OWNED_ACTORS.has(mod.actors[0]))
+	for i in range(1, 4):
+		check("fish %d is local only (not announced as an owned actor)" % (i + 2), mod.actors[i] != null and not NW.OWNED_ACTORS.has(mod.actors[i]) and not mod.actors[i].is_in_group("owned_actor"))
+		check("fish %d is not sending zone/position updates" % (i + 2), mod.actors[i].remembered_zone == "" and not NW.is_connected("_network_tick", mod.actors[i], "_network_share"))
+		check("fish %d has no zone sync timer (only the scene's own timer)" % (i + 2), _timers(mod.actors[i]) == 1)
+	check("the game's own fish does have the zone sync timer (so the check above means something)", _timers(vanilla) == 2)
+	check("fish 2 does not follow the game's aquarium update", not PD.is_connected("_aquarium_update", mod.actors[0], "_host_change_id"))
+	check("fish 2 has no broken join connection", not NW.is_connected("_new_player_join", mod.actors[0], "_host_change_id"))
+	check("fish 3 does not follow the game's aquarium update", not PD.is_connected("_aquarium_update", mod.actors[1], "_host_change_id"))
+	check("fish 2 was sent once", mod.sent.size() == 1 and mod.sent[0][0] == mod.actors[0].actor_id and mod.sent[0][1]["ref"] == refs[1])
+	check("sent fish data has what the receivers need", mod.sent[0][1].has("id") and mod.sent[0][1].has("size") and mod.sent[0][1].has("quality") and mod.sent[0][1].has("ref"))
+	for i in 4:
+		var sprite = mod.actors[i].get_node("Sprite3D")
+		check("fish %d shows its fish" % (i + 2), sprite.texture != null)
+	check("a local fish sits in the tank area", mod.actors[2].global_transform.origin.distance_to(loc.global_transform.origin) < 14)
+	yield(tick(), "completed")
+	check("ticking again sends nothing new", mod.sent.size() == 1)
+	var vis = yield(wait_visible(true), "completed")
+	if not vis:
+		for a in owned_fish_actors():
+			print("note  not visible: ", a.actor_id, " controlled=", a.controlled, " in_zone=", a.in_zone, " zone=", a.current_zone, " hidden=", a.hidden, " visible=", a.visible)
+	check("all five are visible when I'm in the aquarium zone", vis)
+	world.active_zone = "main_zone"
+	var hidden = yield(wait_visible(false), "completed")
+	check("all five are hidden outside the aquarium zone", hidden)
+	world.active_zone = "aquarium_zone"
+
+	print("--- a player joins later")
+	mod._on_player_join()
+	yield(tick(), "completed")
+	check("fish 2 is sent again to the newcomer", mod.sent.size() == 2)
+
+	print("--- what other players' games accept")
+	NW.STEAM_LOBBY_ID = 1
+	for i in 5:
+		world._instance_actor({"actor_type": "aqua_fish", "at": Vector3.ZERO, "zone": "aquarium_zone", "actor_id": 9000 + i, "creator_id": 777, "rot": Vector3.ZERO, "zone_owner": - 1}, 777)
+	NW.STEAM_LOBBY_ID = 0
+	var theirs = 0
+	for a in get_nodes_in_group("actor"):
+		if is_instance_valid(a) and a.get("owner_id") == 777 and a.get("actor_type") == "aqua_fish":
+			theirs += 1
+	check("the game keeps only 2 aquarium fish per other player (the cap the mod works around)", theirs == 2)
+	for a in get_nodes_in_group("actor"):
+		if is_instance_valid(a) and a.get("owner_id") == 777:
+			a.queue_free()
+
+	print("--- take a fish out")
+	var inv0 = PD.inventory.size()
+	check("take the middle fish", mod.take(2) == "")
+	check("it is back in the inventory", PD.inventory.size() == inv0 + 1 and _in_inventory(refs[2]))
+	check("the others closed up", mod.all_fish().size() == 4 and mod.all_fish()[2]["ref"] == refs[3] and mod.all_fish()[3]["ref"] == refs[4])
+	check("the game's own slot is unchanged", PD.saved_aqua_fish["ref"] == refs[0])
+	check("taking a fish that isn't there is refused", mod.take(9) != "")
+	check("take the game's own fish", mod.take(0) == "")
+	check("it is back in the inventory too", _in_inventory(refs[0]))
+	check("the game's slot is filled again by the next fish", PD.saved_aqua_fish["ref"] == refs[1] and mod.extras.size() == 2)
+	check("3 fish left, in order", mod.all_fish().size() == 3 and mod.all_fish()[1]["ref"] == refs[3] and mod.all_fish()[2]["ref"] == refs[4])
+	yield(tick(), "completed")
+	yield(self, "idle_frame")
+	check("fish 2 now shows the next fish", mod.actors[0].get_node("Sprite3D").texture != null and mod.sent[mod.sent.size() - 1][1]["ref"] == refs[3])
+	check("the fish that moved away from slot 4 is gone from the tank", mod.actors[2].get_node("Sprite3D").texture == null)
+	check("the leftover empty fish 3 only exists locally (nothing sent for it)", mod.sent.size() == 3)
+
+	print("--- swap in a full tank")
+	player.hold(refs[0])
+	mod.add_held(player)
+	player.hold(refs[2])
+	mod.add_held(player)
+	check("full again", mod.fish_count() == 5)
+	player.hold(refs[5])
+	var all_before = mod.all_fish()
+	check("swap into an extra slot", mod.swap(player, 3) == "")
+	check("held fish is in that slot", mod.all_fish()[3]["ref"] == refs[5])
+	check("the old fish came back", _in_inventory(all_before[3]["ref"]) and not _in_inventory(refs[5]))
+	check("still 5, other slots untouched", mod.fish_count() == 5 and mod.all_fish()[0]["ref"] == all_before[0]["ref"] and mod.all_fish()[4]["ref"] == all_before[4]["ref"])
+	var back = all_before[3]["ref"]
+	player.hold(back)
+	check("swap into the game's own slot", mod.swap(player, 0) == "")
+	check("held fish is in the game's slot", PD.saved_aqua_fish["ref"] == back)
+	check("the old first fish came back", _in_inventory(all_before[0]["ref"]))
+	player.hold(0)
+	check("swapping with nothing held is refused", mod.swap(player, 1) != "")
+
+	print("--- the list while the tank is full")
+	player.hold(refs[3] if _in_inventory(refs[3]) else all_before[0]["ref"])
+	tank._activate(player)
+	check("rows say Swap when the tank is full and a fish is held", mod.ui_list.get_child(0).get_child(0).get_child(2).text == "Swap")
+	check("add button disabled when full", mod.ui_add.disabled)
+	mod.close()
+	player.hold(0)
+	tank._activate(player)
+	check("rows say Take when nothing is held", mod.ui_list.get_child(0).get_child(0).get_child(2).text == "Take")
+	mod.close()
+
+	print("--- things that are not fish")
+	var chest = PD._add_item("treasure_chest", - 1, 1.0, 0)
+	player.hold(chest)
+	check("a non-fish can't be added", mod.held_fish(player) == null)
+	check("adding it is refused", mod.add_held(player) != "" or mod.fish_count() == 5)
+	check("the tank stays full and the chest stays in the inventory", mod.fish_count() == 5 and _in_inventory(chest))
+	player.hold(0)
+
+	print("--- a damaged or odd file")
+	mod.take(4)
+	mod.take(3)
+	mod.take(2)
+	mod.take(1)
+	check("everything out again", mod.fish_count() == 1)
+	var in_inv = refs[4]
+	if not _in_inventory(in_inv):
+		in_inv = all_before[4]["ref"]
+	var odd = {"version": 1, "fish": [
+		{"id": FISH[0], "ref": 111, "size": 33.5, "quality": 2},
+		{"id": "no_such_fish", "ref": 112, "size": 10.0, "quality": 0},
+		{"id": "treasure_chest", "ref": 113, "size": 1.0, "quality": 0},
+		{"id": FISH[1], "ref": in_inv, "size": 10.0, "quality": 0},
+		{"id": FISH[2], "ref": 114, "size": 12.0, "quality": 99, "custom_name": "Big [b]Bob[/b] with a name that is far too long to fit"},
+		{"id": FISH[3], "ref": 115},
+		"nonsense",
+		{"id": FISH[4], "ref": 116, "size": 5.0, "quality": 0},
+		{"id": FISH[5], "ref": 117, "size": 6.0, "quality": 0},
+		{"id": FISH[6], "ref": 118, "size": 7.0, "quality": 0},
+	]}
+	f.open("user://aquarium_slot_-1.json", File.WRITE)
+	f.store_string(JSON.print(odd))
+	f.close()
+	mod.loaded_slot = - 999
+	mod._check_slot()
+	var refs_loaded = []
+	for e in mod.extras:
+		refs_loaded.append(e["ref"])
+	check("unknown, non-fish, incomplete and non-object entries are skipped", not refs_loaded.has(112) and not refs_loaded.has(113) and not refs_loaded.has(115))
+	check("a fish that is also in the inventory is not loaded twice", not refs_loaded.has(in_inv))
+	check("no more than 4 extras", mod.extras.size() == 4 and refs_loaded == [111, 114, 116, 117])
+	check("quality is limited to the game's range", mod.extras[1]["quality"] == 5)
+	check("a custom name loses [ ] and is cut at 28 characters", mod.extras[1]["custom_name"].find("[") == - 1 and mod.extras[1]["custom_name"].length() <= 28)
+	f.open("user://aquarium_slot_-1.json", File.WRITE)
+	f.store_string("{ this is not json")
+	f.close()
+	mod.loaded_slot = - 999
+	mod._check_slot()
+	check("garbage file: nothing loaded, no crash", mod.extras.size() == 0)
+	check("garbage file: a copy is kept", f.file_exists("user://aquarium_slot_-1.json.unreadable"))
+
+	print("--- other save slots, new games")
+	mod.extras = [mod._clean({"id": FISH[0], "ref": 5551, "size": 10.0, "quality": 0})]
+	mod._save_file()
+	US.current_loaded_slot = 7
+	mod._check_slot()
+	check("another save slot has its own (empty) list", mod.extras.size() == 0)
+	US.current_loaded_slot = - 1
+	mod._check_slot()
+	check("going back loads the first slot's fish again", mod.extras.size() == 1 and mod.extras[0]["ref"] == 5551)
+	PD.emit_signal("_save_reset")
+	check("starting a new game in the slot clears the extra fish and their file", mod.extras.size() == 0 and not f.file_exists("user://aquarium_slot_-1.json"))
+
+	print("--- the list closes by itself")
+	tank._activate(player)
+	player.queue_free()
+	yield(self, "idle_frame")
+	mod._ui_process()
+	check("the list closes when the player is gone", mod.ui == null)
+
+	print("SUMMARY ", checks, " checks, ", fails, " failed")
+	quit()
+
+
+func _in_inventory(ref):
+	for it in PD.inventory:
+		if it["ref"] == ref:
+			return true
+	return false
+
+
+func _timers(n):
+	var c = 0
+	for ch in n.get_children():
+		if ch is Timer:
+			c += 1
+	return c
