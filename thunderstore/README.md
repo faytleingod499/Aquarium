@@ -32,8 +32,8 @@ Put the two fish you want to show off in the first two places (take a fish out a
 - Starting a new game in a save slot clears that slot's extra fish.
 - A fish can never be in your inventory and the aquarium at once: if the game's save and the mod's file ever disagree after a crash, the fish stays in your inventory.
 
-## Also fixes
+## Also
 
-When somebody joins after you, the game is meant to send them your aquarium fish again, but that call fails with an error. The mod makes it work, so people who join later see your fish too.
+The game re-sends your aquarium fish to everybody every 10 seconds. The mod also sends them the moment somebody joins (the game's own "send on join" call fails with an error), so a new player sees your fish at once instead of up to 10 seconds later.
 
 Source and license (MIT): https://github.com/faytleingod499/Aquarium

@@ -13,11 +13,12 @@ extends Node
 #    refuse a third aquarium fish from one player, and sending actors they refuse would only cost them network traffic.
 #  - Everything is client side; nothing needs to be installed on the server or on other players' games.
 
-const VERSION = "1.0.0"
+const VERSION = "1.0.1"
 
 const MAX_FISH = 5                    # in the tank in total, including the game's own slot
 const NETWORKED_FISH = 2              # the first two fish are real actors that other players' games show
 const POLL = 0.5                      # seconds between checks of the tank hook / fish actors
+const RESEND_EVERY = 10.0             # seconds between re-sends of the announced fish (the game's own fish does the same)
 const POPUP = "AQUARIUM_MOD"          # entry in the HUD's popup list: it freezes the player and frees the mouse
 const SAVE_PATH = "user://aquarium_slot_%d.json"
 const EMPTY_FISH = {"id": "empty", "size": 1.0, "ref": 0, "quality": 0}
@@ -37,6 +38,7 @@ const COL_GOOD = Color(0.62, 0.85, 0.6, 1)
 
 var clock = 0.0
 var poll = 0.0
+var resend_clock = 0.0
 var extras = []              # fish #2 to #5 (dictionaries like the game's inventory items)
 var loaded_slot = -999       # the save slot `extras` was read for
 var actors = []              # actors[i] shows extras[i]; null until it is needed
@@ -60,7 +62,8 @@ func _ready():
 		actors.append(null)
 		applied.append("")
 	# `_new_player_join` passes the joiner's id, but the game's fish actor connects it to a function without
-	# parameters, which Godot refuses to call; the `_empty` version of the same signal has no parameter.
+	# parameters, which Godot refuses to call (the game's 10 s timer covers late joiners anyway, just slower); the
+	# `_empty` version of the same signal has no parameter, so the mod answers that one at once.
 	Network.connect("_new_player_join_empty", self, "_on_player_join")
 	PlayerData.connect("_save_reset", self, "_on_save_reset")
 
@@ -69,6 +72,10 @@ func _process(delta):
 	clock += delta
 	if ui != null:
 		_ui_process()
+	resend_clock += delta
+	if resend_clock >= RESEND_EVERY:
+		resend_clock = 0.0
+		_resend()
 	poll += delta
 	if poll < POLL:
 		return
@@ -178,8 +185,7 @@ func _on_player_join():
 	var v = _vanilla_actor()
 	if v != null and v.has_method("_host_change_id"):
 		v._host_change_id()
-	if applied.size() > 0:
-		applied[0] = ""
+	_resend()
 
 
 func _spawn(world, networked):
@@ -228,12 +234,18 @@ func _spawn_local(world, pos):
 	return a
 
 
-# The game's fish actor shows PlayerData.saved_aqua_fish whenever it changes. The mod's fish show their own fish.
+# The game's fish actor shows PlayerData.saved_aqua_fish (fish 1) whenever it changes, when somebody joins AND every 10
+# seconds (a Timer in the scene is connected to the same function). The mod's fish show their own fish, so all three
+# connections are cut; without the timer's, every extra fish turned into a copy of fish 1 after 10 seconds, and told
+# everybody else's game so too.
 func _unhook_vanilla(a):
 	if PlayerData.is_connected("_aquarium_update", a, "_host_change_id"):
 		PlayerData.disconnect("_aquarium_update", a, "_host_change_id")
 	if Network.is_connected("_new_player_join", a, "_host_change_id"):
 		Network.disconnect("_new_player_join", a, "_host_change_id")
+	var t = a.get_node_or_null("Timer")
+	if t != null and t.is_connected("timeout", a, "_host_change_id"):
+		t.disconnect("timeout", a, "_host_change_id")
 
 
 func _show(a, fish, networked):
@@ -246,6 +258,17 @@ func _show(a, fish, networked):
 # (a separate function so that tests can see what would be sent)
 func _send(a, fish):
 	Network._send_actor_action(a.actor_id, "_change_id", [fish])
+
+
+# The game's own fish tells everybody what it shows every 10 seconds (a Timer in its scene), which is how players who
+# join later get it. The mod's announced fish (fish 2) has that timer cut off (see _unhook_vanilla), so it does the same.
+func _resend():
+	for i in NETWORKED_FISH - 1:
+		var a = actors[i]
+		if a == null or not is_instance_valid(a):
+			continue
+		var want = extras[i] if i < extras.size() else null
+		_send(a, want.duplicate(true) if want != null else EMPTY_FISH.duplicate(true))
 
 
 func _sig(fish):

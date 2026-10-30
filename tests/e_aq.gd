@@ -104,6 +104,7 @@ func _go():
 	yield(self, "idle_frame")
 	mod = load(T + "/spy_main.gd").new()
 	mod.name = "Aquarium"
+	mod.resend_clock = - 1000.0   # the automatic 10 s resend is tested on its own, further down
 	root.add_child(mod)
 	yield(self, "idle_frame")
 
@@ -186,6 +187,20 @@ func _go():
 	check("fish 2 does not follow the game's aquarium update", not PD.is_connected("_aquarium_update", mod.actors[0], "_host_change_id"))
 	check("fish 2 has no broken join connection", not NW.is_connected("_new_player_join", mod.actors[0], "_host_change_id"))
 	check("fish 3 does not follow the game's aquarium update", not PD.is_connected("_aquarium_update", mod.actors[1], "_host_change_id"))
+	print("--- the scene's own 10 s timer must not copy fish 1 onto the others (reported by the user in game)")
+	check("fish 1 keeps the game's timer resend (it is how the game tells late joiners)", _timer_hooked(vanilla))
+	for i in 4:
+		check("fish %d: the scene's timer is not connected to the game's resend" % (i + 2), not _timer_hooked(mod.actors[i]))
+	var before = []
+	for i in 4:
+		before.append(look(mod.actors[i]))
+		check("fish %d looks different from fish 1 (so the check below means something)" % (i + 2), before[i] != look(vanilla))
+	for a in owned_fish_actors():
+		a.get_node("Timer").emit_signal("timeout")   # what the game does every 10 seconds
+	for i in 4:
+		check("fish %d still shows its own fish after the timer fired" % (i + 2), look(mod.actors[i]) == before[i])
+	check("fish 1 still shows fish 1", look(vanilla).find("<empty>") == - 1)
+
 	check("fish 2 was sent once", mod.sent.size() == 1 and mod.sent[0][0] == mod.actors[0].actor_id and mod.sent[0][1]["ref"] == refs[1])
 	check("sent fish data has what the receivers need", mod.sent[0][1].has("id") and mod.sent[0][1].has("size") and mod.sent[0][1].has("quality") and mod.sent[0][1].has("ref"))
 	for i in 4:
@@ -271,6 +286,30 @@ func _go():
 	check("rows say Take when nothing is held", mod.ui_list.get_child(0).get_child(0).get_child(2).text == "Take")
 	mod.close()
 
+	print("--- the announced fish 2 is re-sent now and then (the game's timer resend is cut off for it)")
+	var n0 = mod.sent.size()
+	mod._resend()
+	check("one resend, for fish 2 only", mod.sent.size() == n0 + 1 and mod.sent[n0][0] == mod.actors[0].actor_id)
+	check("and it carries fish 2's own data", mod.sent[n0][1]["ref"] == mod.all_fish()[1]["ref"])
+
+	print("--- real time: 11 seconds pass (the game's timers run, nobody calls anything)")
+	yield(tick(), "completed")   # (the actors follow the data within half a second; start from a settled tank)
+	var looks_before = []
+	for a in owned_fish_actors():
+		looks_before.append([a, look(a)])
+	var n1 = mod.sent.size()
+	mod.resend_clock = 0.0
+	yield(create_timer(11.0), "timeout")
+	var still_ok = true
+	for pair in looks_before:
+		if is_instance_valid(pair[0]) and look(pair[0]) != pair[1]:
+			still_ok = false
+	for pair in looks_before:
+		if is_instance_valid(pair[0]) and look(pair[0]) != pair[1]:
+			print("note  changed: ", pair[0].actor_id, "  before: ", pair[1], "  after: ", look(pair[0]))
+	check("after 11 real seconds every fish still shows its own fish", still_ok and looks_before.size() == 5)
+	check("the mod re-sent fish 2 once by itself, to the right actor", mod.sent.size() == n1 + 1 and mod.sent[n1][0] == mod.actors[0].actor_id)
+
 	print("--- things that are not fish")
 	var chest = PD._add_item("treasure_chest", - 1, 1.0, 0)
 	player.hold(chest)
@@ -335,10 +374,15 @@ func _go():
 
 	print("--- the list closes by itself")
 	tank._activate(player)
+	check("the list is open before the player goes", mod.ui != null)
 	player.queue_free()
-	yield(self, "idle_frame")
-	mod._ui_process()
-	check("the list closes when the player is gone", mod.ui == null)
+	var closed = false
+	for k in 30:
+		yield(self, "idle_frame")
+		if mod.ui == null:
+			closed = true
+			break
+	check("the list closes by itself when the player is gone", closed and hud.popups.empty())
 
 	print("SUMMARY ", checks, " checks, ", fails, " failed")
 	quit()
@@ -357,3 +401,16 @@ func _timers(n):
 		if ch is Timer:
 			c += 1
 	return c
+
+
+func _timer_hooked(a):
+	return a.get_node("Timer").is_connected("timeout", a, "_host_change_id")
+
+
+# what a fish actor looks like (headless has no pixels to compare, so: the size of the picture, its colour and the
+# values the actor derives from the fish it shows)
+func look(a):
+	var sp = a.get_node("Sprite3D")
+	if sp.texture == null:
+		return "<empty>"
+	return str(sp.scale) + "|" + str(sp.modulate) + "|" + str(a.speed) + "|" + str(sp.texture.get_width()) + "x" + str(sp.texture.get_height())
