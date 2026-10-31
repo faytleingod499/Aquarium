@@ -1,8 +1,8 @@
 {
     "name": "Aquarium",
-    "version_number": "1.0.1",
+    "version_number": "1.1.0",
     "website_url": "https://github.com/faytleingod499/Aquarium",
-    "description": "Hold up to 5 fish in the aquarium instead of 1, with a list to take, add or swap them. Client side, works on any server. Other players see your first 2 fish. This mod was created with the assistance of AI.",
+    "description": "Hold up to 5 fish in the aquarium instead of 1, with a list to take, add or swap them. Client side, works on any server. Everyone sees your first 2 fish; players with this mod see all 5. This mod was created with the assistance of AI.",
     "dependencies": [
         "NotNet-GDWeave-2.0.14"
     ]

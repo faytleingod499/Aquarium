@@ -310,6 +310,188 @@ func _go():
 	check("after 11 real seconds every fish still shows its own fish", still_ok and looks_before.size() == 5)
 	check("the mod re-sent fish 2 once by itself, to the right actor", mod.sent.size() == n1 + 1 and mod.sent[n1][0] == mod.actors[0].actor_id)
 
+	print("--- fish 3 to 5 are published for the other players who have the mod")
+	mod.sync_dirty = true
+	mod._sync_lobby()
+	var mytext = mod.lobby_data.get(4242, "")
+	check("my member data holds fish 3 to 5, not fish 1 and 2", mytext.begins_with("1~") and mod._decode(mytext).size() == 3)
+	var pub = mod._decode(mytext)
+	var all5 = mod.all_fish()
+	var same_refs = true
+	for i in 3:
+		if pub[i]["ref"] != all5[i + 2]["ref"] or pub[i]["id"] != all5[i + 2]["id"] or pub[i]["quality"] != all5[i + 2]["quality"] or abs(pub[i]["size"] - all5[i + 2]["size"]) > 0.01:
+			same_refs = false
+	check("they are exactly my places 3, 4 and 5", same_refs)
+	check("fish 1 and 2 are not in it (everybody sees those anyway)", mytext.find(str(all5[0]["ref"])) == - 1 and mytext.find(str(all5[1]["ref"])) == - 1)
+	var w0 = mod.writes.size()
+	mod.next_check = 0.0
+	mod._sync_lobby()
+	check("nothing is written again while the lobby still holds it", mod.writes.size() == w0)
+	mod.lobby_data.erase(4242)
+	mod.next_check = 0.0
+	mod._sync_lobby()
+	check("a write that got lost (or a new lobby) is written again", mod.writes.size() == w0 + 1 and mod.lobby_data.get(4242, "") == mytext)
+	mod.lobby_id = 2
+	mod._sync_lobby()
+	check("a different lobby gets it at once", mod.writes.size() == w0 + 2)
+	mod.lobby_id = 1
+	mod._sync_lobby()
+	var saved_extras = mod.extras.duplicate(true)
+	mod.extras = [saved_extras[0]]   # (Godot 3's Array.slice includes its end index, so build these by hand)
+	check("with fish 1 and 2 only there is nothing to publish", mod._my_text() == "")
+	mod.extras = [saved_extras[0], saved_extras[1]]
+	check("with 3 fish there is one in it", mod._decode(mod._my_text()).size() == 1)
+	mod.extras = saved_extras
+	var wc = mod.writes.size()
+	mod.lobby_id = 0
+	mod.sync_dirty = true
+	mod._sync_lobby()
+	check("outside a lobby nothing is written", mod.writes.size() == wc)
+	mod.lobby_id = 1
+	mod.sync_dirty = true
+	mod._sync_lobby()
+
+	print("--- hostile text from another player")
+	var good = "%s|40.00|0|111" % FISH[0]
+	check("a normal fish decodes", mod._decode("1~" + good).size() == 1)
+	check("empty text", mod._decode("").empty())
+	check("wrong version", mod._decode("2~" + good).empty())
+	check("no version", mod._decode(good).empty())
+	check("unknown fish", mod._decode("1~no_such_fish|40.00|0|111").empty())
+	check("an item that is not a fish", mod._decode("1~treasure_chest|40.00|0|111").empty())
+	check("a path as the fish id", mod._decode("1~../../root/Network|40.00|0|111").empty() and mod._decode("1~res://x.gd|40.00|0|111").empty())
+	check("capitals in the id", mod._decode("1~Fish_Lake_Bluegill|40.00|0|111").empty())
+	check("too few or too many fields", mod._decode("1~%s|40.00|0" % FISH[0]).empty() and mod._decode("1~%s|40.00|0|111|9" % FISH[0]).empty())
+	check("text instead of numbers", mod._decode("1~%s|big|0|111" % FISH[0]).empty() and mod._decode("1~%s|40.00|x|111" % FISH[0]).empty() and mod._decode("1~%s|40.00|0|y" % FISH[0]).empty())
+	check("only 3 fish are taken from a longer list", mod._decode("1~" + "~".join(PoolStringArray([good, good, good, good, good]))).size() == 3)
+	check("text longer than allowed", mod._decode("1~" + good + "~" + "x".repeat(700)).empty())
+	var big = mod._decode("1~%s|99999999.00|0|111" % FISH[0])
+	var avg = float(GL.item_data[FISH[0]]["file"].average_size)
+	check("a huge size is cut to %s times the average" % mod.SIZE_LIMIT, big.size() == 1 and abs(big[0]["size"] - avg * mod.SIZE_LIMIT) < 0.01)
+	check("a negative size is cut to the smallest", mod._decode("1~%s|-5.00|0|111" % FISH[0])[0]["size"] == 0.01)
+	check("an infinite size is cut too", mod._decode("1~%s|1e999|0|111" % FISH[0]).size() == 0 or mod._decode("1~%s|1e999|0|111" % FISH[0])[0]["size"] <= avg * mod.SIZE_LIMIT)
+	check("quality is cut to the game's range", mod._decode("1~%s|40.00|99|111" % FISH[0])[0]["quality"] == 5 and mod._decode("1~%s|40.00|-3|111" % FISH[0])[0]["quality"] == 0)
+	check("one bad fish does not spoil the others", mod._decode("1~no_such|1.00|0|1~" + good).size() == 1)
+
+	print("--- other players' fish 3 to 5, shown while I am in the aquarium")
+	var mine_local = []
+	for i in range(1, 4):
+		mine_local.append(look(mod.actors[i]))
+	var p555 = make_other(555)
+	var p556 = make_other(556)
+	var me_again = make_other(4242)    # my own id: never treated as another player
+	var dead = make_other(558)
+	dead.dead_actor = true
+	mod.lobby_data[555] = mytext        # player 555 has the same fish 3 to 5 as I have: they must look identical
+	mod.lobby_data[556] = "1~%s|30.00|1|333~%s|20.00|0|444" % [FISH[2], FISH[3]]
+	mod.lobby_data[558] = mytext
+	yield(tick(), "completed")
+	yield(tick(), "completed")
+	check("player 555 has 3 fish shown", mod.others.has(555) and mod.others[555]["actors"].size() == 3)
+	check("player 556 has 2 fish shown", mod.others.has(556) and mod.others[556]["actors"].size() == 2)
+	check("my own id and a dead player's are not shown", not mod.others.has(4242) and not mod.others.has(558))
+	var same_look = true
+	for i in 3:
+		if look(mod.others[555]["actors"][i]) != mine_local[i]:
+			same_look = false
+	check("player 555's fish look exactly like my own fish 3 to 5 (what I publish is what they show)", same_look)
+	check("player 556's two fish are not empty and differ", look(mod.others[556]["actors"][0]) != "<empty>" and look(mod.others[556]["actors"][0]) != look(mod.others[556]["actors"][1]))
+	check("the game's own fish is still found as the game's own fish", mod._vanilla_actor() == vanilla)
+	vanilla.remove_from_group("actor")
+	check("with the game's fish gone, none of the mod's local fish is taken for it", mod._vanilla_actor() == null)
+	vanilla.add_to_group("actor")
+	var theirs_ok = true
+	for id in [555, 556]:
+		for a in mod.others[id]["actors"]:
+			if NW.OWNED_ACTORS.has(a) or a.is_in_group("owned_actor") or NW.is_connected("_network_tick", a, "_network_share") or _timer_hooked(a) or PD.is_connected("_aquarium_update", a, "_host_change_id"):
+				theirs_ok = false
+	check("they are local only: nothing announced, no updates, no game timer, no follow of my fish 1", theirs_ok)
+	var tb = []
+	for a in mod.others[556]["actors"]:
+		tb.append(look(a))
+	for id in [555, 556]:
+		for a in mod.others[id]["actors"]:
+			a.get_node("Timer").emit_signal("timeout")
+	var tl = []
+	for a in mod.others[556]["actors"]:
+		tl.append(look(a))
+	check("the game's 10 s timer does not turn them into fish 1", tb == tl)
+	var n_sent = mod.sent.size()
+	yield(tick(), "completed")
+	check("showing them sends nothing to anybody", mod.sent.size() == n_sent)
+
+	mod.lobby_data[556] = "1~%s|99.00|2|555" % FISH[4]
+	var old_actor = mod.others[556]["actors"][1]
+	yield(tick(), "completed")
+	check("when the data shrinks the spare fish go away", mod.others[556]["actors"].size() == 1 and not is_instance_valid(old_actor))
+	check("and the first one shows the new fish", look(mod.others[556]["actors"][0]).find("<empty>") == - 1 and look(mod.others[556]["actors"][0]) != tb[0])
+	mod.lobby_data[556] = ""
+	var last_actor = mod.others[556]["actors"][0]
+	yield(tick(), "completed")
+	check("when a player takes their fish out, theirs are gone", not mod.others.has(556) and not is_instance_valid(last_actor))
+
+	PD.players_hidden.append(555)
+	var h_actor = mod.others[555]["actors"][0]
+	yield(tick(), "completed")
+	check("a player I have hidden (or Griefer Shield has) is not shown", not mod.others.has(555) and not is_instance_valid(h_actor))
+	PD.players_hidden.erase(555)
+	yield(tick(), "completed")
+	check("and is shown again when no longer hidden", mod.others.has(555) and mod.others[555]["actors"].size() == 3)
+
+	mod.lobby_data[555] = "garbage"
+	yield(tick(), "completed")
+	check("garbage from a player shows nothing and breaks nothing", mod.others.has(555) and mod.others[555]["actors"].empty())
+	mod.lobby_data[555] = mytext
+	yield(tick(), "completed")
+	p555.queue_free()
+	var leaving = mod.others[555]["actors"][0]
+	yield(self, "idle_frame")
+	yield(tick(), "completed")
+	check("a player who left takes their fish with them", not mod.others.has(555) and not is_instance_valid(leaving))
+
+	print("--- caps")
+	var crowd = []
+	for i in 26:
+		var c = make_other(9000 + i)
+		crowd.append(c)
+		mod.lobby_data[9000 + i] = mytext
+	yield(tick(), "completed")
+	yield(tick(), "completed")
+	check("at most %d other players are looked at" % mod.MAX_OTHER_PLAYERS, mod.others.size() <= mod.MAX_OTHER_PLAYERS)
+	check("at most %d fish of other players at once" % mod.MAX_OTHER_FISH, mod._other_fish_count() == mod.MAX_OTHER_FISH)
+	var contiguous = true
+	for id in mod.others.keys():
+		for a in mod.others[id]["actors"]:
+			if a == null or not is_instance_valid(a):
+				contiguous = false
+	check("the cap leaves no empty places behind", contiguous)
+
+	print("--- only in the aquarium, only in a lobby")
+	world.active_zone = "main_zone"
+	var some = mod.others[mod.others.keys()[0]]["actors"][0]
+	yield(tick(), "completed")
+	check("outside the aquarium nothing of other players exists", mod.others.empty() and not is_instance_valid(some))
+	world.active_zone = "aquarium_zone"
+	yield(tick(), "completed")
+	check("back in the aquarium their fish appear again", mod.others.size() > 0)
+	mod.lobby_id = 0
+	yield(tick(), "completed")
+	check("without a lobby nothing of other players is shown", mod.others.empty())
+	mod.lobby_id = 1
+	for c in crowd:
+		c.queue_free()
+	p556.queue_free()
+	me_again.queue_free()
+	dead.queue_free()
+	yield(tick(), "completed")
+	yield(tick(), "completed")
+	check("everybody gone: nothing left", mod.others.empty() and mod._other_fish_count() == 0)
+	var stray = 0
+	for a in get_nodes_in_group("actor"):
+		if is_instance_valid(a) and a.has_meta("aquarium_mod") and not mod.actors.has(a):
+			stray += 1
+	check("no fish of other players is left over", stray == 0)
+
 	print("--- things that are not fish")
 	var chest = PD._add_item("treasure_chest", - 1, 1.0, 0)
 	player.hold(chest)
@@ -414,3 +596,11 @@ func look(a):
 	if sp.texture == null:
 		return "<empty>"
 	return str(sp.scale) + "|" + str(sp.modulate) + "|" + str(a.speed) + "|" + str(sp.texture.get_width()) + "x" + str(sp.texture.get_height())
+
+
+func make_other(id):
+	var n = Node.new()
+	n.set_script(load(T + "/stub_other.gd"))
+	n.owner_id = id
+	root.add_child(n)
+	return n

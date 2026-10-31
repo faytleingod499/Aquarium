@@ -9,16 +9,27 @@ extends Node
 #    everyone sees, exactly as without the mod, and it is what is left if the mod is removed.
 #  - Fish #2 to #5 are kept in the mod's own file, one per save slot: user://aquarium_slot_<N>.json.
 #  - Fish #2 is a real aquarium fish actor like fish #1, so every player's game shows it (the game accepts two
-#    aquarium fish per player from other players). Fish #3 to #5 are shown only in your own game: other players' games
-#    refuse a third aquarium fish from one player, and sending actors they refuse would only cost them network traffic.
-#  - Everything is client side; nothing needs to be installed on the server or on other players' games.
+#    aquarium fish per player from other players). Fish #3 to #5 are never sent as actors: other players' games refuse
+#    a third aquarium fish from one player, and sending actors they refuse would only cost them network traffic.
+#  - Fish #3 to #5 are shared a second way: each player who has the mod writes them into their own Steam lobby member
+#    data (key "aquarium", like Plushie and Hugs and More do for their things), and every player who has the mod reads
+#    those of the others and shows them as local fish while in the aquarium. Players without the mod see fish #1 and
+#    #2 only (the game's own limit), and nothing else changes for them.
+#  - Everything is client side; nothing needs to be installed on the server.
 
-const VERSION = "1.0.1"
+const VERSION = "1.1.0"
 
 const MAX_FISH = 5                    # in the tank in total, including the game's own slot
 const NETWORKED_FISH = 2              # the first two fish are real actors that other players' games show
 const POLL = 0.5                      # seconds between checks of the tank hook / fish actors
 const RESEND_EVERY = 10.0             # seconds between re-sends of the announced fish (the game's own fish does the same)
+const SYNC_KEY = "aquarium"           # my Steam lobby member data: fish 3 to 5, for the other players who have the mod
+const CHECK_EVERY = 3.0               # seconds between reading my own member data back (a write while joining is lost)
+const MAX_TEXT = 600                  # longest member data text accepted from another player
+const MAX_OTHER_PLAYERS = 24          # most other players whose fish are shown
+const MAX_OTHER_FISH = 60             # most fish of other players shown at once (all together)
+const SIZE_LIMIT = 6.0                # a fish of another player is at most this many times the fish's average size
+const ZONE = "aquarium_zone"
 const POPUP = "AQUARIUM_MOD"          # entry in the HUD's popup list: it freezes the player and frees the mouse
 const SAVE_PATH = "user://aquarium_slot_%d.json"
 const EMPTY_FISH = {"id": "empty", "size": 1.0, "ref": 0, "quality": 0}
@@ -39,6 +50,11 @@ const COL_GOOD = Color(0.62, 0.85, 0.6, 1)
 var clock = 0.0
 var poll = 0.0
 var resend_clock = 0.0
+var steam = null             # the Steam singleton (null where there is none)
+var sync_dirty = true        # my member data has to be written
+var next_check = 0.0
+var last_lobby = 0
+var others = {}              # steam id -> {"text", "fish", "actors", "applied"}: other players' fish 3 to 5 that I show
 var extras = []              # fish #2 to #5 (dictionaries like the game's inventory items)
 var loaded_slot = -999       # the save slot `extras` was read for
 var actors = []              # actors[i] shows extras[i]; null until it is needed
@@ -64,6 +80,8 @@ func _ready():
 	# `_new_player_join` passes the joiner's id, but the game's fish actor connects it to a function without
 	# parameters, which Godot refuses to call (the game's 10 s timer covers late joiners anyway, just slower); the
 	# `_empty` version of the same signal has no parameter, so the mod answers that one at once.
+	if Engine.has_singleton("Steam"):
+		steam = Engine.get_singleton("Steam")
 	Network.connect("_new_player_join_empty", self, "_on_player_join")
 	PlayerData.connect("_save_reset", self, "_on_save_reset")
 
@@ -92,11 +110,14 @@ func _tick():
 	var player = _player()
 	if player == null:
 		_forget_actors()
+		_clear_others()
 		return
 	_check_slot()
+	_sync_lobby()
 	if player.get("world") == null:
 		return
 	_sync_actors(player)
+	_sync_others(player)
 
 
 func _player():
@@ -166,7 +187,7 @@ func _vanilla_actor():
 	for a in get_tree().get_nodes_in_group("actor"):
 		if not is_instance_valid(a) or a.get("actor_type") != "aqua_fish":
 			continue
-		if a.get("owner_id") != Network.STEAM_ID or actors.has(a):
+		if a.get("owner_id") != Network.STEAM_ID or actors.has(a) or a.has_meta("aquarium_mod"):
 			continue
 		return a
 	return null
@@ -227,6 +248,7 @@ func _spawn_local(world, pos):
 	world.entities.add_child(a)
 	a.global_transform.origin = pos
 	a.owner_id = Network.STEAM_ID
+	a.set_meta("aquarium_mod", true)   # not the game's own fish (see _vanilla_actor)
 	a._setup_controlled()
 	_unhook_vanilla(a)
 	if Network.is_connected("_network_tick", a, "_network_share"):
@@ -391,6 +413,7 @@ func _put(fish):
 
 
 func _changed():
+	sync_dirty = true
 	_save_file()
 	_save_game()
 	if ui != null:
@@ -443,6 +466,7 @@ func _check_slot():
 
 
 func _load_file():
+	sync_dirty = true
 	extras = []
 	var path = _path()
 	var f = File.new()
@@ -502,11 +526,214 @@ func _save_file():
 
 # a new game was started in the save slot: the old extra fish belong to the old game
 func _on_save_reset():
+	sync_dirty = true
 	extras = []
 	_forget_actors()
 	var d = Directory.new()
 	if d.file_exists(_path()):
 		d.remove(_path())
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Fish 3 to 5, for the other players who have the mod (Steam lobby member data)
+# ---------------------------------------------------------------------------------------------------------------
+# Text: "1~<id>|<size>|<quality>|<ref>~<id>|..." (up to 3 fish). Everything read from another player is checked: only
+# fish the game knows, sizes within what the game can roll, qualities within the game's range, at most 3 fish, short text.
+
+func _lobby():
+	if Network.PLAYING_OFFLINE:
+		return 0
+	var l = Network.STEAM_LOBBY_ID
+	return int(l) if l != null and int(l) > 0 else 0
+
+
+func _write_member(text):
+	var lobby = _lobby()
+	if steam == null or lobby <= 0 or not steam.has_method("setLobbyMemberData"):
+		return
+	steam.setLobbyMemberData(lobby, SYNC_KEY, text)
+
+
+func _read_member(id):
+	var lobby = _lobby()
+	if steam == null or lobby <= 0 or not steam.has_method("getLobbyMemberData"):
+		return ""
+	return str(steam.getLobbyMemberData(lobby, int(id), SYNC_KEY))
+
+
+func _encode(f):
+	return "|".join(PoolStringArray([str(f["id"]), "%.2f" % float(f["size"]), str(int(f["quality"])), str(int(f["ref"]))]))
+
+
+# my fish 3 to 5 as text ("" when there are none)
+func _my_text():
+	var parts = []
+	for i in range(NETWORKED_FISH - 1, extras.size()):
+		parts.append(_encode(extras[i]))
+	if parts.empty():
+		return ""
+	var text = "1~" + "~".join(PoolStringArray(parts))
+	return text if text.length() < MAX_TEXT else ""
+
+
+func _valid_fish_id(id):
+	var text = str(id)
+	if text.length() < 1 or text.length() > 64:
+		return false
+	for i in range(text.length()):
+		var code = text.ord_at(i)
+		if not ((code >= 97 and code <= 122) or (code >= 48 and code <= 57) or code == 95):
+			return false
+	if not Globals.item_data.has(text):
+		return false
+	return Globals.item_data[text]["file"].category == "fish"
+
+
+# text from another player -> a list of fish (empty when it is not valid)
+func _decode(text):
+	var out = []
+	text = str(text)
+	if text.length() < 4 or text.length() > MAX_TEXT or not text.begins_with("1~"):
+		return out
+	for rec in text.substr(2).split("~", false):
+		if out.size() >= MAX_FISH - NETWORKED_FISH:
+			break
+		var f = str(rec).split("|")
+		if f.size() != 4 or not _valid_fish_id(f[0]):
+			continue
+		if f[1].length() > 14 or f[2].length() > 3 or f[3].length() > 12:
+			continue
+		if not f[1].is_valid_float() or not f[2].is_valid_integer() or not f[3].is_valid_integer():
+			continue
+		var average = float(Globals.item_data[f[0]]["file"].average_size)
+		out.append({
+			"id": f[0],
+			"size": clamp(float(f[1]), 0.01, max(average * SIZE_LIMIT, 1.0)),
+			"quality": int(clamp(int(f[2]), 0, PlayerData.QUALITY_DATA.size() - 1)),
+			"ref": int(f[3]),
+		})
+	return out
+
+
+# writes my fish 3 to 5 when they changed, and again when what the lobby holds is not what I wrote (a write made while
+# still joining a lobby is lost, and a new lobby starts empty)
+func _sync_lobby():
+	var lobby = _lobby()
+	if lobby <= 0:
+		last_lobby = 0
+		return
+	if lobby != last_lobby:
+		last_lobby = lobby
+		sync_dirty = true
+	var mine = _my_text()
+	if clock >= next_check:
+		next_check = clock + CHECK_EVERY
+		if _read_member(Network.STEAM_ID) != mine:
+			sync_dirty = true
+	if sync_dirty:
+		sync_dirty = false
+		_write_member(mine)
+
+
+func _other_players():
+	var out = []
+	var me = int(Network.STEAM_ID)
+	for p in get_tree().get_nodes_in_group("player"):
+		if not is_instance_valid(p) or p.get("dead_actor") == true or p.get("NPC_body") == true:
+			continue
+		var id = p.get("owner_id")
+		if id == null or int(id) <= 0 or int(id) == me:
+			continue
+		if PlayerData.players_hidden.has(int(id)) or out.has(int(id)):
+			continue
+		out.append(int(id))
+	out.sort()
+	if out.size() > MAX_OTHER_PLAYERS:
+		out.resize(MAX_OTHER_PLAYERS)
+	return out
+
+
+# shows the other players' fish 3 to 5 while I am in the aquarium (nothing is created anywhere else)
+func _sync_others(player):
+	var world = player.get("world")
+	if world == null or _lobby() <= 0 or world.get("active_zone") != ZONE:
+		_clear_others()
+		return
+	var ids = _other_players()
+	for id in others.keys():
+		if not ids.has(id):
+			_drop_other(id)
+	for id in ids:
+		var text = _read_member(id)
+		var rec = others.get(id)
+		if rec == null:
+			if text == "":
+				continue
+			rec = {"text": null, "fish": [], "actors": [], "applied": []}
+			others[id] = rec
+		if text != rec["text"]:
+			rec["text"] = text
+			rec["fish"] = _decode(text)
+		_apply_other(world, rec)
+		if text == "":
+			_drop_other(id)
+
+
+func _apply_other(world, rec):
+	var want = rec["fish"]
+	var list = rec["actors"]
+	var seen = rec["applied"]
+	while list.size() > want.size():
+		var gone = list.pop_back()
+		seen.pop_back()
+		if is_instance_valid(gone):
+			gone.queue_free()
+	for i in want.size():
+		if i < list.size() and not is_instance_valid(list[i]):
+			list[i] = null
+			seen[i] = ""
+		if i >= list.size() or list[i] == null:
+			if _other_fish_count() >= MAX_OTHER_FISH:
+				return
+			var locs = get_tree().get_nodes_in_group("aqua_spawn_loc")
+			if locs.empty():
+				return
+			var a = _spawn_local(world, locs[0].global_transform.origin)
+			if a == null:
+				return
+			if i >= list.size():
+				list.append(a)
+				seen.append("")
+			else:
+				list[i] = a
+				seen[i] = ""
+		var sig = _sig(want[i])
+		if seen[i] != sig:
+			seen[i] = sig
+			_show(list[i], want[i], false)
+
+
+func _other_fish_count():
+	var n = 0
+	for id in others.keys():
+		for a in others[id]["actors"]:
+			if a != null and is_instance_valid(a):
+				n += 1
+	return n
+
+
+func _drop_other(id):
+	if not others.has(id):
+		return
+	for a in others[id]["actors"]:
+		if a != null and is_instance_valid(a):
+			a.queue_free()
+	others.erase(id)
+
+
+func _clear_others():
+	for id in others.keys():
+		_drop_other(id)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -659,7 +886,7 @@ func _row(i, fish, swap_mode):
 	vb.alignment = BoxContainer.ALIGN_CENTER
 	hb.add_child(vb)
 
-	var seen = "everyone can see this fish" if i < NETWORKED_FISH else "only you can see this fish"
+	var seen = "everyone can see this fish" if i < NETWORKED_FISH else "players with this mod can see this fish"
 	if fish != null:
 		var q = PlayerData.QUALITY_DATA.get(fish["quality"], PlayerData.QUALITY_DATA[0])
 		var title = _label("%d.  %s" % [i + 1, fish_name(fish)], Color(q["color"]) if fish["quality"] > 0 else COL_TEXT)

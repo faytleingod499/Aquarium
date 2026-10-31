@@ -18,12 +18,15 @@ Use the aquarium tank (the same interact key as before). A list opens with the f
 
 ## Who sees what
 
-The game only lets another player's game show **2 aquarium fish per player**, so:
+The game only lets another player's game show **2 aquarium fish per player**. That is the game's own rule and it is the same with or without this mod, so:
 
-- Fish **1 and 2** are shown to everybody, with or without this mod.
-- Fish **3 to 5** are shown only in your own game (the list says "only you can see this fish" for them).
+- Fish **1 and 2** are shown to everybody, mod or not.
+- Fish **3 to 5** are shown to other players **who also have this mod**. Players without the mod see only fish 1 and 2, and nothing can change that on your side.
+- The list says which is which ("everyone can see this fish" / "players with this mod can see this fish").
 
-Put the two fish you want to show off in the first two places (take a fish out and add it again to change the order).
+Put the two fish you want everybody to see in the first two places (take a fish out and add it again to change the order).
+
+How it works: fish 3 to 5 are written into your Steam lobby data (their type, size and quality, a few dozen characters), the same way other mods share small things, and the mod on the other side shows them while that player is in the aquarium. Everything read from another player is checked first (only fish the game knows, sizes the game can roll, at most 3 fish). Players you have hidden are not shown, and at most 24 players / 60 fish are shown at once.
 
 ## Your fish are safe
 
